@@ -66,6 +66,19 @@ async fn main() -> anyhow::Result<()> {
     let mut st = AgentState::load(&cfg.state_path)
         .with_context(|| format!("loading agent state from {}", cfg.state_path.display()))?;
 
+    // `--reset`: forget the pinned server + stale session (keeping the machine
+    // identity key) so the agent re-pins on the next connect. The deliberate
+    // escape hatch for a legitimately rotated server identity (e.g. a dev DB
+    // recreate). NOT automatic — an unexpected identity change must refuse, not
+    // silently re-trust.
+    if std::env::args().skip(1).any(|a| a == "--reset") {
+        tracing::warn!("--reset: forgetting the pinned server + session; will re-pin on connect");
+        st.server_identity = None;
+        st.machine_id = None;
+        st.session_token = None;
+        st.save(&cfg.state_path)?;
+    }
+
     // 1. Machine identity key — generated once, then persisted + reused.
     let signing_key = load_or_create_key(&mut st, &cfg.state_path)?;
     let public = signing_key.verifying_key().to_bytes();
@@ -229,8 +242,9 @@ fn machine_label() -> String {
 fn describe_connect(err: ConnectError) -> anyhow::Error {
     match err {
         ConnectError::IdentityMismatch => anyhow!(
-            "server identity does not match the pinned key — refusing to connect \
-             (delete the agent state to re-pin a known-good server)"
+            "server identity does not match the pinned key — refusing to connect. \
+             If the server legitimately rotated its identity (e.g. a dev DB recreate), \
+             re-run with `--reset` to forget the old pin and re-pin."
         ),
         other => anyhow!("could not reach or verify the server: {other:?}"),
     }
