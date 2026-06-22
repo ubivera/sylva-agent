@@ -11,7 +11,7 @@ publish = false
 # (incl. the Machine client). The agent is a new consumer of the same core the
 # WinUI app uses.
 sylva-sdk = { path = "../sylva-sdk" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "signal", "net", "sync"] }
 tonic = "0.14"
 # The machine identity key: Ed25519 keygen + the proof-of-possession signature.
 ed25519-dalek = { version = "2", features = ["rand_core"] }
@@ -21,6 +21,11 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = "0.3"
 anyhow = "1"
+
+# Windows location API (CP3 probe + the future real collector). Scoped features
+# only (Geolocation + Foundation's IAsyncOperation), not the whole Win32 surface.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = ["Devices_Geolocation", "Foundation"] }
 
 [lints.rust]
 unsafe_code = "forbid"

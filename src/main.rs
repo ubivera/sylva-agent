@@ -8,6 +8,8 @@
 //! (encrypted to the device-admin group key) lands in CP3. See
 //! `docs/design/agent.md`.
 
+mod collector;
+mod probe;
 mod state;
 
 use std::path::PathBuf;
@@ -17,15 +19,20 @@ use anyhow::{Context, anyhow};
 use ed25519_dalek::{Signer, SigningKey};
 use rand::{RngCore, rngs::OsRng};
 use sylva_sdk::proto::machine::v1::{
-    CheckInRequest, Empty, RegisterMachineRequest, machine_client::MachineClient, server_push,
+    CheckInRequest, Empty, MachineConfig, RegisterMachineRequest, ReportTelemetryRequest,
+    TelemetryBlob, machine_client::MachineClient, server_push,
 };
 use sylva_sdk::transport::{self, ConnectError, TrustDecision};
 use tonic::transport::Channel;
 
+use collector::LocationCollector;
 use state::AgentState;
 
 const AGENT_VERSION: &str = env!("CARGO_PKG_VERSION");
 const CHECK_IN_INTERVAL: Duration = Duration::from_secs(60);
+/// How often to collect + report location when it's enabled. ponytail: fixed
+/// interval for now; server-driven cadence is a later refinement.
+const REPORT_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Where to find the server + where to keep machine-scoped state.
 struct Config {
@@ -56,6 +63,13 @@ impl Config {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // One-shot diagnostic: probe the OS location API, print the result, exit.
+    // Run as your user AND as SYSTEM (PsExec -s) to learn the service-context
+    // behavior before the collector is built. Bypasses the normal agent flow.
+    if std::env::args().skip(1).any(|a| a == "--probe-location") {
+        return probe::run();
+    }
+
     tracing_subscriber::fmt()
         .with_max_level(tracing::Level::INFO)
         .init();
@@ -113,10 +127,16 @@ async fn main() -> anyhow::Result<()> {
     let token = register(&mut client, &mut st, &cfg, &signing_key, &public).await?;
     tracing::info!(machine_id = ?st.machine_id, "registered; entering run loop");
 
-    // 4. Run the check-in loop + the push-stream consumer until Ctrl-C / error.
+    // 4. Run: check-in loop + push-stream consumer + location-report loop until
+    //    Ctrl-C / error. The subscribe consumer publishes the latest server config
+    //    to a watch channel; the report loop reads it to decide whether to collect.
+    let (config_tx, config_rx) = tokio::sync::watch::channel(MachineConfig::default());
+    let collector: Box<dyn LocationCollector> = Box::new(collector::WindowsLocationCollector);
+
     tokio::select! {
         result = check_in_loop(client.clone(), token.clone()) => result?,
-        result = subscribe_loop(client.clone(), token) => result?,
+        result = subscribe_loop(client.clone(), token.clone(), config_tx) => result?,
+        result = report_loop(client.clone(), token, config_rx, collector) => result?,
         _ = tokio::signal::ctrl_c() => tracing::info!("received Ctrl-C, shutting down"),
     }
     Ok(())
@@ -190,8 +210,13 @@ async fn check_in_loop(mut client: MachineClient<Channel>, token: String) -> any
     }
 }
 
-/// Hold the server push stream open and log what arrives (config + keep-alives).
-async fn subscribe_loop(mut client: MachineClient<Channel>, token: String) -> anyhow::Result<()> {
+/// Hold the server push stream open; publish each config to the watch channel
+/// (the report loop reads it) and log keep-alives.
+async fn subscribe_loop(
+    mut client: MachineClient<Channel>,
+    token: String,
+    config_tx: tokio::sync::watch::Sender<MachineConfig>,
+) -> anyhow::Result<()> {
     let mut stream = client
         .subscribe(authed(&token, Empty {}))
         .await
@@ -200,7 +225,12 @@ async fn subscribe_loop(mut client: MachineClient<Channel>, token: String) -> an
     while let Some(push) = stream.message().await.context("server push stream error")? {
         match push.payload {
             Some(server_push::Payload::Config(cfg)) => {
-                tracing::info!(location_enabled = cfg.location_enabled, "config push");
+                tracing::info!(
+                    location_enabled = cfg.location_enabled,
+                    has_group = !cfg.device_admin_group_public.is_empty(),
+                    "config push"
+                );
+                let _ = config_tx.send(cfg);
             }
             Some(server_push::Payload::KeepAlive(_)) => tracing::debug!("keep-alive"),
             None => {}
@@ -208,6 +238,65 @@ async fn subscribe_loop(mut client: MachineClient<Channel>, token: String) -> an
     }
     tracing::info!("server closed the push stream");
     Ok(())
+}
+
+/// When location is enabled AND a device-admin group key is provisioned, collect
+/// a fix, seal it to the group key, and report it on a schedule. Collection
+/// failures (e.g. the OS location service is off) are logged + skipped, not fatal.
+async fn report_loop(
+    mut client: MachineClient<Channel>,
+    token: String,
+    config_rx: tokio::sync::watch::Receiver<MachineConfig>,
+    collector: Box<dyn LocationCollector>,
+) -> anyhow::Result<()> {
+    let mut ticker = tokio::time::interval(REPORT_INTERVAL);
+    ticker.tick().await; // consume the immediate first tick
+    let mut seq: u64 = 0;
+    loop {
+        ticker.tick().await;
+        let config = config_rx.borrow().clone();
+        if !config.location_enabled || config.device_admin_group_public.is_empty() {
+            continue;
+        }
+        let Ok(group_public): std::result::Result<[u8; 32], _> =
+            config.device_admin_group_public.as_slice().try_into()
+        else {
+            tracing::warn!("device-admin group public key is not 32 bytes; skipping report");
+            continue;
+        };
+        let fix = match collector.collect() {
+            Ok(fix) => fix,
+            Err(err) => {
+                tracing::warn!(?err, "location collection failed; skipping this report");
+                continue;
+            }
+        };
+        let ciphertext = match collector::encode_fix(&fix)
+            .and_then(|pt| Ok(sylva_sdk::crypto::seal_to(&group_public, &pt)?))
+        {
+            Ok(ct) => ct,
+            Err(err) => {
+                tracing::warn!(?err, "encrypting the fix failed; skipping this report");
+                continue;
+            }
+        };
+        seq += 1;
+        let blob = TelemetryBlob {
+            kind: "location".to_string(),
+            recipient_key_id: config.group_key_id.clone(),
+            seq,
+            ciphertext,
+            signature: Vec::new(),
+        };
+        client
+            .report_telemetry(authed(
+                &token,
+                ReportTelemetryRequest { blobs: vec![blob] },
+            ))
+            .await
+            .context("report_telemetry failed")?;
+        tracing::info!(accuracy_m = fix.accuracy_m, "reported location");
+    }
 }
 
 /// Wrap a message in a request carrying the machine session token.
