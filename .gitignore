@@ -1,0 +1,71 @@
+# Whitelist .gitignore: ignore everything by default, explicitly allow only the files
+# that belong in the repo. When you add a new file type, add it to the allowlist below.
+
+# ─── Step 1: ignore everything ────────────────────────────────────────────────
+*
+
+# ─── Step 2: allow git to descend into directories ────────────────────────────
+# Without these, git won't look inside subdirectories at all, and the allowlist
+# below can never match nested files.
+!*/
+!.github/
+
+# ─── Step 3: allowlist (essential file types and specific filenames) ──────────
+
+# Repo metadata
+!.gitignore
+!.gitattributes
+!.editorconfig
+
+# Project / build configuration
+!*.toml
+!*.lock
+
+# Documentation and license
+!*.md
+!LICENSE
+!LICENSE.*
+
+# Source
+!*.rs
+
+# CI workflows
+!*.yml
+!*.yaml
+
+# Future: WiX MSI installer sources (the Windows Service host, CP2)
+!*.wxs
+!*.wxi
+!*.wxl
+
+# Static assets shipped with the repo (logos, diagrams)
+!*.png
+!*.jpg
+!*.jpeg
+!*.svg
+!*.webp
+
+# ─── Step 4: re-ignore noise that the allowlist would otherwise let through ───
+# These run last so they override anything matched above.
+
+# Rust build artifacts
+target/
+*.pdb
+*.swp
+*.swo
+*~
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Local config / secrets (overrides !*.toml for the *.local.toml case)
+.env
+.env.*
+*.local.toml
+/secrets/
+
+# Agent runtime state — holds this machine's identity key + session token.
+# (JSON isn't in the allowlist, so it's already ignored; explicit + documented
+# here because leaking it would expose the machine's credentials.)
+sylva-agent-state.json
